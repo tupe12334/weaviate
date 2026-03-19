@@ -182,7 +182,6 @@ func (c *replicationClient) CompareDigests(ctx context.Context,
 	}
 
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Accept-Response-Encoding", "binary")
 
 	res, err := c.client.Do(req)
 	if err != nil {

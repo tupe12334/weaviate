@@ -548,9 +548,16 @@ func (i *replicatedIndices) getObjectsDigestsInRange() http.Handler {
 	})
 }
 
+// compareDigestsMaxPayload is the largest binary body postCompareDigests will
+// accept: one record per object in the largest permitted diff batch (10 000
+// objects × 24 bytes, matching maxDiffBatchSize in shard_async_replication.go).
+const compareDigestsMaxPayload = 10_000 * replica.DigestObjectsInRangeRecordLength
+
 // postCompareDigests decodes a binary-encoded list of source digests, delegates
-// to the replicator to compare against local state, and returns (also binary)
-// only those digests that the source must propagate.
+// to the replicator to compare against local state, and returns the stale
+// subset as a binary stream. The protocol is binary-only: there is no JSON
+// fallback and no content-negotiation header required. Both request and
+// response use the same 24-byte record layout as digestsInRange.
 func (i *replicatedIndices) postCompareDigests() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		args := regexCompareDigests.FindStringSubmatch(r.URL.Path)
@@ -562,8 +569,13 @@ func (i *replicatedIndices) postCompareDigests() http.Handler {
 		index, shard := args[1], args[2]
 
 		defer r.Body.Close()
-		body, err := io.ReadAll(r.Body)
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, compareDigestsMaxPayload))
 		if err != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(err, &mbe) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "read request body: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -598,7 +610,24 @@ func (i *replicatedIndices) postCompareDigests() http.Handler {
 			return
 		}
 
-		writeDigestsInRangeResponse(w, r, stale)
+		// Encode all records before writing headers so that a UUID parse error
+		// doesn't produce an http.Error after headers have been sent.
+		out := make([]byte, 0, len(stale)*replica.DigestObjectsInRangeRecordLength)
+		var obuf [replica.DigestObjectsInRangeRecordLength]byte
+		for _, d := range stale {
+			id, err := uuid.Parse(d.ID)
+			if err != nil {
+				http.Error(w, "parse uuid: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			copy(obuf[:16], id[:])
+			binary.BigEndian.PutUint64(obuf[16:], uint64(d.UpdateTime))
+			out = append(out, obuf[:]...)
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+		w.Write(out) //nolint:errcheck
 	})
 }
 

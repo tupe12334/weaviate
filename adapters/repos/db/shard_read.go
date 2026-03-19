@@ -215,47 +215,34 @@ func (s *Shard) ObjectDigestsInRange(ctx context.Context,
 	return objs, nil
 }
 
-// CompareDigests performs an O(N_source + N_range) merge-scan between the
-// caller's sourceDigests and this shard's local LSM. It returns only those
-// entries that the caller must propagate: objects missing from this shard
-// (returned with UpdateTime==0) or stale on this shard (returned with the
-// local UpdateTime so the caller can supply it as remoteStaleUpdateTime).
+// CompareDigests identifies which of the caller's sourceDigests this shard is
+// missing or has stale. It returns only those entries that the caller must
+// propagate: objects missing from this shard (returned with UpdateTime==0) or
+// stale on this shard (returned with the local UpdateTime so the caller can
+// supply it as remoteStaleUpdateTime).
 //
-// The algorithm scans the local LSM exactly once over the UUID range
-// [sourceDigests[0].ID, sourceDigests[N-1].ID] and uses a map for O(1)
-// per-object comparison, replacing the O(N_local_batches × N_remote_batches)
-// nested HTTP loop in objectsToPropagateWithinRange.
+// Algorithm: one cursor.Seek per source UUID — O(N_source × log N_local).
+// Each Seek descends the LSM index directly to the target key, so the cost is
+// independent of how many local objects exist between consecutive source UUIDs.
+// This avoids the O(N_range) range-scan regression that occurs when source
+// UUIDs are sparse relative to the local shard population.
 func (s *Shard) CompareDigests(ctx context.Context, sourceDigests []types.RepairResponse) ([]types.RepairResponse, error) {
+	s.activityTrackerRead.Add(1)
+
 	if len(sourceDigests) == 0 {
 		return nil, nil
 	}
 
-	// Index source digests by binary UUID key for O(1) lookup during LSM scan.
-	type sourceEntry struct {
-		id         string
-		sourceTime int64
-	}
-	sourceByKey := make(map[[16]byte]sourceEntry, len(sourceDigests))
+	bucket := s.store.Bucket(helpers.ObjectsBucketLSM)
+	cursor := bucket.Cursor()
+	defer cursor.Close()
 
-	firstUUID, err := uuid.Parse(sourceDigests[0].ID)
-	if err != nil {
-		return nil, fmt.Errorf("parse first source uuid %q: %w", sourceDigests[0].ID, err)
-	}
-	firstBytes, err := firstUUID.MarshalBinary()
-	if err != nil {
-		return nil, fmt.Errorf("marshal first uuid: %w", err)
-	}
-
-	lastUUID, err := uuid.Parse(sourceDigests[len(sourceDigests)-1].ID)
-	if err != nil {
-		return nil, fmt.Errorf("parse last source uuid %q: %w", sourceDigests[len(sourceDigests)-1].ID, err)
-	}
-	lastBytes, err := lastUUID.MarshalBinary()
-	if err != nil {
-		return nil, fmt.Errorf("marshal last uuid: %w", err)
-	}
-
+	var result []types.RepairResponse
 	for _, d := range sourceDigests {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		u, err := uuid.Parse(d.ID)
 		if err != nil {
 			return nil, fmt.Errorf("parse source uuid %q: %w", d.ID, err)
@@ -264,43 +251,21 @@ func (s *Shard) CompareDigests(ctx context.Context, sourceDigests []types.Repair
 		if err != nil {
 			return nil, fmt.Errorf("marshal uuid: %w", err)
 		}
-		var k [16]byte
-		copy(k[:], b)
-		sourceByKey[k] = sourceEntry{id: d.ID, sourceTime: d.UpdateTime}
-	}
 
-	// Scan local LSM in [first, last] range and record local update times.
-	localByKey := make(map[[16]byte]int64, len(sourceDigests))
-	bucket := s.store.Bucket(helpers.ObjectsBucketLSM)
-	cursor := bucket.Cursor()
-	defer cursor.Close()
-
-	for k, v := cursor.Seek(firstBytes); k != nil && bytes.Compare(k, lastBytes) < 1; k, v = cursor.Next() {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		var key [16]byte
-		copy(key[:], k)
-		if _, found := sourceByKey[key]; !found {
+		k, v := cursor.Seek(b)
+		if k == nil || !bytes.Equal(k, b) {
+			// Key absent from this shard — source must propagate.
+			result = append(result, types.RepairResponse{ID: d.ID, UpdateTime: 0})
 			continue
 		}
+
 		_, localTime, err := storobj.DocIDAndTimeFromBinary(v)
 		if err != nil {
 			return nil, fmt.Errorf("extract update time: %w", err)
 		}
-		localByKey[key] = localTime
-	}
-
-	// Return only the objects the source needs to propagate.
-	var result []types.RepairResponse
-	for key, se := range sourceByKey {
-		localTime, exists := localByKey[key]
-		if !exists {
-			// Missing from this shard — source must propagate.
-			result = append(result, types.RepairResponse{ID: se.id, UpdateTime: 0})
-		} else if se.sourceTime > localTime {
+		if d.UpdateTime > localTime {
 			// This shard has a stale version — source must propagate.
-			result = append(result, types.RepairResponse{ID: se.id, UpdateTime: localTime})
+			result = append(result, types.RepairResponse{ID: d.ID, UpdateTime: localTime})
 		}
 	}
 

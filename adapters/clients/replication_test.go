@@ -783,6 +783,133 @@ func TestReplicationDigestObjectsInRange(t *testing.T) {
 	})
 }
 
+func TestReplicationCompareDigests(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	// Two digests the source has locally; their UUIDs are valid RFC-4122 strings.
+	input := []types.RepairResponse{
+		{ID: UUID1.String(), UpdateTime: now.UnixMilli()},
+		{ID: UUID2.String(), UpdateTime: now.Add(time.Hour).UnixMilli()},
+	}
+	// The target reports that UUID1 is missing (UpdateTime==0) and UUID2 is stale.
+	stale := []types.RepairResponse{
+		{ID: UUID1.String(), UpdateTime: 0},
+		{ID: UUID2.String(), UpdateTime: now.UnixMilli()},
+	}
+
+	// buildBinaryPayload encodes a slice of RepairResponse records using the
+	// same 24-byte layout as writeDigestsInRangeResponse.
+	buildBinaryPayload := func(records []types.RepairResponse) []byte {
+		buf := make([]byte, len(records)*replica.DigestObjectsInRangeRecordLength)
+		for i, r := range records {
+			id, err := uuid.Parse(r.ID)
+			require.NoError(t, err)
+			idBytes, err := id.MarshalBinary()
+			require.NoError(t, err)
+			copy(buf[i*replica.DigestObjectsInRangeRecordLength:], idBytes)
+			binary.BigEndian.PutUint64(buf[i*replica.DigestObjectsInRangeRecordLength+16:], uint64(r.UpdateTime))
+		}
+		return buf
+	}
+
+	t.Run("BinaryRequestEncoding", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, http.MethodPost, r.Method)
+			assert.Equal(t, "/replicas/indices/C1/shards/S1/objects/compareDigests", r.URL.Path)
+			assert.Equal(t, "application/octet-stream", r.Header.Get("Content-Type"))
+			// compareDigests is binary-only; no content-negotiation header is sent.
+			assert.Empty(t, r.Header.Get("X-Accept-Response-Encoding"))
+
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			require.Equal(t, len(input)*replica.DigestObjectsInRangeRecordLength, len(body))
+
+			// Decode and verify each record.
+			for i, in := range input {
+				off := i * replica.DigestObjectsInRangeRecordLength
+				rec := body[off : off+replica.DigestObjectsInRangeRecordLength]
+				id, err := uuid.FromBytes(rec[:16])
+				require.NoError(t, err)
+				assert.Equal(t, in.ID, id.String())
+				assert.Equal(t, uint64(in.UpdateTime), binary.BigEndian.Uint64(rec[16:]))
+			}
+
+			// Return an empty binary response (no X-Response-Encoding needed).
+			w.Header().Set("Content-Type", "application/octet-stream")
+		}))
+		defer server.Close()
+
+		c := newReplicationClient(t, server.Client())
+		_, err := c.CompareDigests(context.Background(), server.URL[7:], "C1", "S1", input)
+		require.NoError(t, err)
+	})
+
+	t.Run("BinaryResponse", func(t *testing.T) {
+		payload := buildBinaryPayload(stale)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
+			w.Write(payload) //nolint:errcheck
+		}))
+		defer server.Close()
+
+		c := newReplicationClient(t, server.Client())
+		got, err := c.CompareDigests(context.Background(), server.URL[7:], "C1", "S1", input)
+		require.NoError(t, err)
+		require.Len(t, got, 2)
+		assert.Equal(t, stale[0].ID, got[0].ID)
+		assert.Equal(t, stale[0].UpdateTime, got[0].UpdateTime)
+		assert.Equal(t, stale[1].ID, got[1].ID)
+		assert.Equal(t, stale[1].UpdateTime, got[1].UpdateTime)
+	})
+
+	t.Run("EmptyBinaryResponse", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			// empty body — nothing stale
+		}))
+		defer server.Close()
+
+		c := newReplicationClient(t, server.Client())
+		got, err := c.CompareDigests(context.Background(), server.URL[7:], "C1", "S1", input)
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("ConnectionError", func(t *testing.T) {
+		c := newReplicationClient(t, &http.Client{})
+		_, err := c.CompareDigests(context.Background(), "127.0.0.1:0", "C1", "S1", input)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "connect")
+	})
+
+	t.Run("ServerError", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		c := newReplicationClient(t, server.Client())
+		_, err := c.CompareDigests(context.Background(), server.URL[7:], "C1", "S1", input)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "status code")
+	})
+
+	t.Run("TruncatedBinaryRecord", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 10 bytes — not a multiple of DigestObjectsInRangeRecordLength (24)
+			w.Write([]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a}) //nolint:errcheck
+		}))
+		defer server.Close()
+
+		c := newReplicationClient(t, server.Client())
+		_, err := c.CompareDigests(context.Background(), server.URL[7:], "C1", "S1", input)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "read digest in range record")
+	})
+}
+
 func TestReplicationOverwriteObjectsCompression(t *testing.T) {
 	t.Parallel()
 

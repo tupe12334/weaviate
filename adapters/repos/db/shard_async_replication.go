@@ -717,6 +717,7 @@ func (s *Shard) handleHashbeatWakeup(
 						"object_digests_diff_took":        stat.objectDigestsDiffTook,
 						"local_object_digests_count":      stat.localObjectDigestsCount,
 						"remote_object_digests_count":     stat.remoteObjectDigestsCount,
+						"stale_object_digests_count":      stat.staleObjectDigestsCount,
 						"local_objects_propagation_count": stat.localObjectsPropagationCount,
 						"local_objects_propagation_took":  stat.localObjectsPropagationTook,
 					}).Debug("updating async replication stats")
@@ -782,6 +783,7 @@ func (s *Shard) handleHashbeatWakeup(
 				WithField("object_digests_diff_took", stat.objectDigestsDiffTook).
 				WithField("local_object_digests_count", stat.localObjectDigestsCount).
 				WithField("remote_object_digests_count", stat.remoteObjectDigestsCount).
+				WithField("stale_object_digests_count", stat.staleObjectDigestsCount).
 				WithField("local_objects_propagation_count", stat.localObjectsPropagationCount).
 				WithField("local_objects_propagation_took", stat.localObjectsPropagationTook).
 				Debug("hashbeat iteration successfully completed")
@@ -825,7 +827,8 @@ type hashBeatHostStats struct {
 	hashtreeDiffTook             time.Duration
 	objectDigestsDiffTook        time.Duration
 	localObjectDigestsCount      int
-	remoteObjectDigestsCount     int
+	remoteObjectDigestsCount     int // digests sent to remote for comparison
+	staleObjectDigestsCount      int // subset returned by remote as missing/stale
 	localObjectsPropagationCount int
 	localObjectsPropagationTook  time.Duration
 	objectsNotResolved           int
@@ -890,6 +893,7 @@ func (s *Shard) hashBeat(ctx context.Context, config AsyncReplicationConfig) (st
 
 	localObjectDigestsCount := 0
 	remoteObjectDigestsCount := 0
+	staleObjectDigestsCount := 0
 
 	localObjectsToPropagate := make([]strfmt.UUID, 0, config.propagationLimit)
 	localUpdateTimeByUUID := make(map[strfmt.UUID]int64, config.propagationLimit)
@@ -929,6 +933,7 @@ func (s *Shard) hashBeat(ctx context.Context, config AsyncReplicationConfig) (st
 
 		localObjectDigestsCount += localObjsCountWithinRange
 		remoteObjectDigestsCount += remoteObjsCountWithinRange
+		staleObjectDigestsCount += len(objsToPropagateWithinRange)
 
 		for _, obj := range objsToPropagateWithinRange {
 			localObjectsToPropagate = append(localObjectsToPropagate, obj.uuid)
@@ -984,6 +989,7 @@ func (s *Shard) hashBeat(ctx context.Context, config AsyncReplicationConfig) (st
 			objectDigestsDiffTook:        objectDigestsDiffTook,
 			localObjectDigestsCount:      localObjectDigestsCount,
 			remoteObjectDigestsCount:     remoteObjectDigestsCount,
+			staleObjectDigestsCount:      staleObjectDigestsCount,
 			localObjectsPropagationCount: len(localObjectsToPropagate),
 			localObjectsPropagationTook:  time.Since(objectsPropagationStart),
 			objectsNotResolved:           objectsNotResolved,
@@ -1084,20 +1090,16 @@ func (s *Shard) objectsToPropagateWithinRange(ctx context.Context, config AsyncR
 
 		// Filter out objects that are too recent to propagate.
 		maxUpdateTime := s.getHashBeatMaxUpdateTime(config, targetNodeName, targetNodeOverrides)
+		filteredDigests := make([]types.RepairResponse, 0, len(allLocalDigests))
 		localDigestsByUUID := make(map[string]types.RepairResponse, len(allLocalDigests))
 		for _, d := range allLocalDigests {
 			if d.UpdateTime <= maxUpdateTime {
+				filteredDigests = append(filteredDigests, d)
 				localDigestsByUUID[d.ID] = d
 			}
 		}
-		if len(localDigestsByUUID) == 0 {
+		if len(filteredDigests) == 0 {
 			break
-		}
-
-		// Build the slice of filtered digests to send to the target.
-		filteredDigests := make([]types.RepairResponse, 0, len(localDigestsByUUID))
-		for _, d := range localDigestsByUUID {
-			filteredDigests = append(filteredDigests, d)
 		}
 
 		// Single round-trip: target responds with only the UUIDs that need
@@ -1107,8 +1109,13 @@ func (s *Shard) objectsToPropagateWithinRange(ctx context.Context, config AsyncR
 			return localObjectsCount, remoteObjectsCount, objectsToPropagate, fmt.Errorf("comparing digests with remote: %w", err)
 		}
 
-		remoteObjectsCount += len(staleDigests)
+		// remoteObjectsCount tracks digests sent to the remote for comparison,
+		// i.e. the volume of the CompareDigests request. Stale digests returned
+		// (objects actually requiring propagation) are a subset of this and are
+		// captured separately via staleObjectDigestsCount at the call site.
+		remoteObjectsCount += len(filteredDigests)
 
+		propagated := 0
 		for _, stale := range staleDigests {
 			localDigest, ok := localDigestsByUUID[stale.ID]
 			if !ok {
@@ -1119,6 +1126,7 @@ func (s *Shard) objectsToPropagateWithinRange(ctx context.Context, config AsyncR
 				lastUpdateTime:        localDigest.UpdateTime,
 				remoteStaleUpdateTime: stale.UpdateTime, // 0 means missing from target
 			})
+			propagated++
 		}
 
 		if len(allLocalDigests) < currBatchSize {
@@ -1131,7 +1139,10 @@ func (s *Shard) objectsToPropagateWithinRange(ctx context.Context, config AsyncR
 		}
 
 		currLocalUUIDBytes = lastLocalUUIDBytes
-		limit -= len(allLocalDigests)
+		// Decrement by objects actually queued for propagation so that limit
+		// reflects remaining propagation capacity, not objects scanned.
+		// Scanning many already-up-to-date objects should not exhaust the limit.
+		limit -= propagated
 	}
 
 	// Note: propagations == 0 means local shard is laying behind remote shard,

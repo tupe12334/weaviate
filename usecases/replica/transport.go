@@ -180,14 +180,6 @@ type DigestObjectsInRangeResp struct {
 	Digests []types.RepairResponse `json:"digests,omitempty"`
 }
 
-// CompareDigestsResp is returned by the target node after comparing source
-// digests against its own local state. It contains only the subset of objects
-// that the source must propagate: those missing from the target (UpdateTime==0)
-// or stale on the target (UpdateTime is the target's current version).
-type CompareDigestsResp struct {
-	Stale []types.RepairResponse `json:"stale,omitempty"`
-}
-
 // WClient is the client used to write to replicas
 type WClient interface {
 	PutObject(ctx context.Context, host, index, shard, requestID string,
