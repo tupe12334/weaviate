@@ -448,6 +448,14 @@ func (f *Finder) DigestObjectsInRange(ctx context.Context,
 	return f.client.DigestObjectsInRange(ctx, host, f.class, shardName, initialUUID, finalUUID, limit)
 }
 
+// CompareDigests sends the source's local digests to the target node and
+// returns only those that need to be propagated (missing or stale on target).
+func (f *Finder) CompareDigests(ctx context.Context,
+	shardName string, host string, digests []types.RepairResponse,
+) ([]types.RepairResponse, error) {
+	return f.client.CompareDigests(ctx, host, f.class, shardName, digests)
+}
+
 // Overwrite specified object with most recent contents
 func (f *Finder) Overwrite(ctx context.Context,
 	host, index, shard string, xs []*objects.VObject,

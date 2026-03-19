@@ -83,6 +83,8 @@ var (
 		`\/shards\/(` + sh + `)\/objects/_digest`)
 	regexObjectsDigestsInRange = regexp.MustCompile(`\/indices\/(` + cl + `)` +
 		`\/shards\/(` + sh + `)\/objects/digestsInRange`)
+	regexCompareDigests = regexp.MustCompile(`\/indices\/(` + cl + `)` +
+		`\/shards\/(` + sh + `)\/objects/compareDigests`)
 	regxHashTreeLevel = regexp.MustCompile(`\/indices\/(` + cl + `)` +
 		`\/shards\/(` + sh + `)\/objects\/hashtree\/level\/(` + l + `)`)
 	regxObjects = regexp.MustCompile(`\/replicas\/indices\/(` + cl + `)` +
@@ -237,6 +239,14 @@ func (i *replicatedIndices) handleRequest(qr queuedRequest) {
 	case regxObjectsDigest.MatchString(path):
 		if r.Method == http.MethodGet {
 			i.getObjectsDigest().ServeHTTP(w, r)
+			return
+		}
+
+		http.Error(w, "405 Method not Allowed", http.StatusMethodNotAllowed)
+		return
+	case regexCompareDigests.MatchString(path):
+		if r.Method == http.MethodPost {
+			i.postCompareDigests().ServeHTTP(w, r)
 			return
 		}
 
@@ -535,6 +545,60 @@ func (i *replicatedIndices) getObjectsDigestsInRange() http.Handler {
 		}
 
 		writeDigestsInRangeResponse(w, r, digests)
+	})
+}
+
+// postCompareDigests decodes a binary-encoded list of source digests, delegates
+// to the replicator to compare against local state, and returns (also binary)
+// only those digests that the source must propagate.
+func (i *replicatedIndices) postCompareDigests() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		args := regexCompareDigests.FindStringSubmatch(r.URL.Path)
+		if len(args) != 3 {
+			http.Error(w, "invalid URI", http.StatusBadRequest)
+			return
+		}
+
+		index, shard := args[1], args[2]
+
+		defer r.Body.Close()
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read request body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Decode binary request: N × DigestObjectsInRangeRecordLength bytes.
+		var sourceDigests []types.RepairResponse
+		if len(body) > 0 {
+			if len(body)%replica.DigestObjectsInRangeRecordLength != 0 {
+				http.Error(w, "invalid binary payload length", http.StatusBadRequest)
+				return
+			}
+			n := len(body) / replica.DigestObjectsInRangeRecordLength
+			sourceDigests = make([]types.RepairResponse, n)
+			for j := 0; j < n; j++ {
+				off := j * replica.DigestObjectsInRangeRecordLength
+				rec := body[off : off+replica.DigestObjectsInRangeRecordLength]
+				id, err := uuid.FromBytes(rec[:16])
+				if err != nil {
+					http.Error(w, "parse uuid from binary: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+				sourceDigests[j] = types.RepairResponse{
+					ID:         id.String(),
+					UpdateTime: int64(binary.BigEndian.Uint64(rec[16:])),
+				}
+			}
+		}
+
+		stale, err := i.replicator.CompareDigests(r.Context(), index, shard, sourceDigests)
+		if err != nil {
+			http.Error(w, "compare digests: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		writeDigestsInRangeResponse(w, r, stale)
 	})
 }
 

@@ -1024,6 +1024,16 @@ type objectToPropagate struct {
 	remoteStaleUpdateTime int64
 }
 
+// objectsToPropagateWithinRange determines which local objects in the given
+// hashtree leaf range the source must propagate to targetNodeAddress.
+//
+// For each local batch it:
+//  1. Fetches local digests via DigestObjectsInRange.
+//  2. Filters out objects that are too recent (per maxUpdateTime).
+//  3. Sends the remaining digests to the target via a single CompareDigests
+//     round-trip. The target returns only those UUIDs that are missing or stale
+//     on its side, collapsing the former O(N_local_batches × N_remote_batches)
+//     nested HTTP scan to O(N_local_batches) round-trips.
 func (s *Shard) objectsToPropagateWithinRange(ctx context.Context, config AsyncReplicationConfig,
 	targetNodeAddress, targetNodeName string, initialLeaf, finalLeaf uint64, limit int,
 	targetNodeOverrides additional.AsyncReplicationTargetNodeOverrides,
@@ -1062,132 +1072,66 @@ func (s *Shard) objectsToPropagateWithinRange(ctx context.Context, config AsyncR
 		}
 
 		if len(allLocalDigests) == 0 {
-			// no more local objects need to be propagated in this iteration
 			break
 		}
 
 		localObjectsCount += len(allLocalDigests)
 
-		// iteration should stop when all local digests within the range has been read
-
-		lastLocalUUID := strfmt.UUID(allLocalDigests[len(allLocalDigests)-1].ID)
-
-		lastLocalUUIDBytes, err := bytesFromUUID(lastLocalUUID)
+		lastLocalUUIDBytes, err := bytesFromUUID(strfmt.UUID(allLocalDigests[len(allLocalDigests)-1].ID))
 		if err != nil {
 			return localObjectsCount, remoteObjectsCount, objectsToPropagate, err
 		}
 
-		localDigestsByUUID := make(map[string]types.RepairResponse, len(allLocalDigests))
-
-		// filter out too recent local digests to avoid object propagation when all the nodes may be alive
-		// or if an upper time bound is configured for shard replica movement
+		// Filter out objects that are too recent to propagate.
 		maxUpdateTime := s.getHashBeatMaxUpdateTime(config, targetNodeName, targetNodeOverrides)
-
+		localDigestsByUUID := make(map[string]types.RepairResponse, len(allLocalDigests))
 		for _, d := range allLocalDigests {
 			if d.UpdateTime <= maxUpdateTime {
 				localDigestsByUUID[d.ID] = d
 			}
 		}
 		if len(localDigestsByUUID) == 0 {
-			// local digests are all too recent, so we can stop now
 			break
 		}
 
-		remoteStaleUpdateTime := make(map[string]int64, len(localDigestsByUUID))
-
-		if len(localDigestsByUUID) > 0 {
-			// fetch digests from remote host in order to avoid sending unnecessary objects
-			for currRemoteUUIDBytes := currLocalUUIDBytes; bytes.Compare(currRemoteUUIDBytes, lastLocalUUIDBytes) < 1; {
-				if ctx.Err() != nil {
-					return localObjectsCount, remoteObjectsCount, objectsToPropagate, ctx.Err()
-				}
-
-				currRemoteUUID, err := uuidFromBytes(currRemoteUUIDBytes)
-				if err != nil {
-					return localObjectsCount, remoteObjectsCount, objectsToPropagate, err
-				}
-
-				// TODO could speed up by passing through the target node override upper time bound here
-				remoteDigests, err := s.index.replicator.DigestObjectsInRange(ctx,
-					s.name, targetNodeAddress, currRemoteUUID, lastLocalUUID, config.diffBatchSize)
-				if err != nil {
-					return localObjectsCount, remoteObjectsCount, objectsToPropagate, fmt.Errorf("fetching remote object digests: %w", err)
-				}
-
-				if len(remoteDigests) == 0 {
-					// no more digests in remote host
-					break
-				}
-
-				remoteObjectsCount += len(remoteDigests)
-
-				for _, d := range remoteDigests {
-					localDigest, ok := localDigestsByUUID[d.ID]
-					if ok {
-						if localDigest.UpdateTime <= d.UpdateTime {
-							// older or up to date objects are not propagated
-							delete(localDigestsByUUID, d.ID)
-
-							if len(localDigestsByUUID) == 0 {
-								// no more local objects need to be propagated in this iteration
-								break
-							}
-						} else {
-							// older object is subject to be overwriten
-							remoteStaleUpdateTime[d.ID] = d.UpdateTime
-						}
-					}
-				}
-
-				if len(localDigestsByUUID) == 0 {
-					// no more local objects need to be propagated in this iteration
-					break
-				}
-
-				if len(remoteDigests) < config.diffBatchSize {
-					break
-				}
-
-				lastRemoteUUID := strfmt.UUID(remoteDigests[len(remoteDigests)-1].ID)
-
-				lastRemoteUUIDBytes, err := bytesFromUUID(lastRemoteUUID)
-				if err != nil {
-					return localObjectsCount, remoteObjectsCount, objectsToPropagate, err
-				}
-
-				overflow := incToNextLexValue(lastRemoteUUIDBytes)
-				if overflow {
-					// no more remote digests need to be fetched
-					break
-				}
-
-				currRemoteUUIDBytes = lastRemoteUUIDBytes
-			}
+		// Build the slice of filtered digests to send to the target.
+		filteredDigests := make([]types.RepairResponse, 0, len(localDigestsByUUID))
+		for _, d := range localDigestsByUUID {
+			filteredDigests = append(filteredDigests, d)
 		}
 
-		for _, obj := range localDigestsByUUID {
+		// Single round-trip: target responds with only the UUIDs that need
+		// propagation (missing or stale on target), eliminating the inner loop.
+		staleDigests, err := s.index.replicator.CompareDigests(ctx, s.name, targetNodeAddress, filteredDigests)
+		if err != nil {
+			return localObjectsCount, remoteObjectsCount, objectsToPropagate, fmt.Errorf("comparing digests with remote: %w", err)
+		}
+
+		remoteObjectsCount += len(staleDigests)
+
+		for _, stale := range staleDigests {
+			localDigest, ok := localDigestsByUUID[stale.ID]
+			if !ok {
+				continue
+			}
 			objectsToPropagate = append(objectsToPropagate, objectToPropagate{
-				uuid:                  strfmt.UUID(obj.ID),
-				lastUpdateTime:        obj.UpdateTime,
-				remoteStaleUpdateTime: remoteStaleUpdateTime[obj.ID],
+				uuid:                  strfmt.UUID(stale.ID),
+				lastUpdateTime:        localDigest.UpdateTime,
+				remoteStaleUpdateTime: stale.UpdateTime, // 0 means missing from target
 			})
 		}
 
 		if len(allLocalDigests) < currBatchSize {
-			// no more local objects need to be propagated
 			break
 		}
 
-		// to avoid reading the last uuid in the next iteration
 		overflow := incToNextLexValue(lastLocalUUIDBytes)
 		if overflow {
-			// no more local objects need to be propagated
 			break
 		}
 
 		currLocalUUIDBytes = lastLocalUUIDBytes
-
-		limit -= len(localDigestsByUUID)
+		limit -= len(allLocalDigests)
 	}
 
 	// Note: propagations == 0 means local shard is laying behind remote shard,

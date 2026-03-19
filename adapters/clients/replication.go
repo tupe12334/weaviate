@@ -147,6 +147,57 @@ func (c *replicationClient) DigestObjectsInRange(ctx context.Context,
 	return resp.Digests, nil
 }
 
+// CompareDigests sends the source's local digests to the target node using a
+// binary-encoded request and decodes the binary response. The target returns
+// only those digests that the source must propagate: objects missing from the
+// target (UpdateTime==0) or stale on the target.
+func (c *replicationClient) CompareDigests(ctx context.Context,
+	host, index, shard string, digests []types.RepairResponse,
+) ([]types.RepairResponse, error) {
+	// Binary-encode the request: N × DigestObjectsInRangeRecordLength bytes.
+	body := make([]byte, 0, len(digests)*replica.DigestObjectsInRangeRecordLength)
+	var buf [replica.DigestObjectsInRangeRecordLength]byte
+	for _, d := range digests {
+		uuidParsed, err := uuid.Parse(d.ID)
+		if err != nil {
+			return nil, fmt.Errorf("parse uuid %q: %w", d.ID, err)
+		}
+		uuidBytes, err := uuidParsed.MarshalBinary()
+		if err != nil {
+			return nil, fmt.Errorf("marshal uuid %q: %w", d.ID, err)
+		}
+		copy(buf[:16], uuidBytes)
+		binary.BigEndian.PutUint64(buf[16:], uint64(d.UpdateTime))
+		body = append(body, buf[:]...)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.timeoutUnit*20)
+	defer cancel()
+
+	req, err := newHttpReplicaRequest(
+		ctx, http.MethodPost, host, index, shard,
+		"", "compareDigests", bytes.NewReader(body), 0)
+	if err != nil {
+		return nil, fmt.Errorf("create http request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Accept-Response-Encoding", "binary")
+
+	res, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(res.Body)
+		return nil, fmt.Errorf("status code: %v, error: %s", res.StatusCode, b)
+	}
+
+	return readDigestsInRangeBinaryStream(res.Body, res.ContentLength)
+}
+
 // readDigestsInRangeBinaryStream decodes a fixed-size binary stream produced
 // by writeDigestsInRangeResponse. Each record is
 // replica.DigestObjectsInRangeRecordLength bytes: 16-byte UUID (RFC-4122

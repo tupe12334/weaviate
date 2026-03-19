@@ -180,6 +180,14 @@ type DigestObjectsInRangeResp struct {
 	Digests []types.RepairResponse `json:"digests,omitempty"`
 }
 
+// CompareDigestsResp is returned by the target node after comparing source
+// digests against its own local state. It contains only the subset of objects
+// that the source must propagate: those missing from the target (UpdateTime==0)
+// or stale on the target (UpdateTime is the target's current version).
+type CompareDigestsResp struct {
+	Stale []types.RepairResponse `json:"stale,omitempty"`
+}
+
 // WClient is the client used to write to replicas
 type WClient interface {
 	PutObject(ctx context.Context, host, index, shard, requestID string,
@@ -225,6 +233,13 @@ type RClient interface {
 
 	DigestObjectsInRange(ctx context.Context, host, index, shard string,
 		initialUUID, finalUUID strfmt.UUID, limit int) ([]types.RepairResponse, error)
+
+	// CompareDigests sends the source node's local digests to the target and
+	// receives back only those that the source needs to propagate. This collapses
+	// the O(N_remote_pages) nested HTTP scan in objectsToPropagateWithinRange to a
+	// single round-trip per local batch.
+	CompareDigests(ctx context.Context, host, index, shard string,
+		digests []types.RepairResponse) ([]types.RepairResponse, error)
 
 	HashTreeLevel(ctx context.Context, host, index, shard string, level int,
 		discriminant *hashtree.Bitset) (digests []hashtree.Digest, err error)
@@ -274,6 +289,15 @@ func (fc FinderClient) DigestObjectsInRange(ctx context.Context,
 	initialUUID, finalUUID strfmt.UUID, limit int,
 ) ([]types.RepairResponse, error) {
 	return fc.cl.DigestObjectsInRange(ctx, host, index, shard, initialUUID, finalUUID, limit)
+}
+
+// CompareDigests sends local digests to the target and returns only those
+// that the source must propagate.
+func (fc FinderClient) CompareDigests(ctx context.Context,
+	host, index, shard string,
+	digests []types.RepairResponse,
+) ([]types.RepairResponse, error) {
+	return fc.cl.CompareDigests(ctx, host, index, shard, digests)
 }
 
 // FullReads read full objects
